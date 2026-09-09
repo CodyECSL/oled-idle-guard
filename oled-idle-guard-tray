@@ -1,0 +1,652 @@
+#!/usr/bin/env python3
+"""
+oled-idle-guard-tray
+====================
+
+System-tray indicator for the oled-idle-guard daemon.
+
+Shows, at a glance:
+  * current state (active / dimmed / locked+blank / snoozed / daemon down)
+  * a live countdown to the next dim and to lock+blank
+  * which input it just saw (keyboard / mouse / gamepad) -- the tray icon
+    pulses and the "Activity monitor" window has per-kind indicator lights
+  * the list of input devices being watched
+
+and lets you:
+  * change the "dim in" / "lock + black in" timeouts (and re-blank delay /
+    dim brightness) live -- persisted by the daemon to overrides.json
+  * snooze the guard for a while (e.g. during a cut-scene / AFK-farming)
+  * lock + blank immediately
+
+It is a plain read-only viewer of /run/oled-idle-guard.state plus a one-line
+command channel at $XDG_RUNTIME_DIR/oled-idle-guard.cmd -- no privileges.
+"""
+
+import json
+import os
+import time
+
+from PySide6.QtCore import Qt, QTimer, QRectF, QPointF
+from PySide6.QtGui import (QAction, QColor, QFont, QIcon, QPainter,
+                           QPainterPath, QPen, QPixmap)
+from PySide6.QtWidgets import (QApplication, QFrame, QGridLayout, QGroupBox,
+                               QHBoxLayout, QLabel, QMenu, QPlainTextEdit,
+                               QPushButton, QSpinBox, QSystemTrayIcon,
+                               QVBoxLayout, QWidget)
+
+STATE_FILE = "/run/oled-idle-guard.state"
+CMD_FILE = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"),
+                        "oled-idle-guard.cmd")
+STALE_AFTER = 8.0
+POLL_MS = 250
+LED_HOLD = 0.6           # seconds a kind's indicator stays lit after input
+
+COL = {
+    "active":       QColor("#27ae60"),
+    "dimmed":       QColor("#e39a1c"),
+    "locked-blank": QColor("#e0503a"),
+    "snoozed":      QColor("#5f7183"),
+    "down":         QColor("#8a8a8a"),
+}
+KIND_EMOJI = {"keyboard": "⌨️", "mouse": "\U0001f5b1️",
+              "gamepad": "\U0001f3ae", "touchpad": "✋", "other": "•"}
+KIND_ORDER = ["keyboard", "mouse", "gamepad", "touchpad", "other"]
+
+
+def read_status():
+    try:
+        with open(STATE_FILE) as fh:
+            d = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(d, dict):
+        return None
+    if d.get("state") == "stopped":
+        return None
+    if time.time() - d.get("ts", 0) > STALE_AFTER:
+        return None
+    return d
+
+
+def send_command(line):
+    try:
+        with open(CMD_FILE, "a") as fh:
+            fh.write(line.rstrip() + "\n")
+    except OSError as e:                                     # noqa: BLE001
+        print("could not write command:", e)
+
+
+def fmt_clock(seconds):
+    if seconds is None:
+        return "—"
+    seconds = max(0, int(round(seconds)))
+    return f"{seconds // 60}:{seconds % 60:02d}"
+
+
+def fmt_ago(wall):
+    if not wall:
+        return "never"
+    d = max(0.0, time.time() - wall)
+    if d < 1:
+        return "now"
+    if d < 60:
+        return f"{int(d)}s ago"
+    if d < 3600:
+        return f"{int(d // 60)}m ago"
+    return f"{int(d // 3600)}h ago"
+
+
+# --------------------------------------------------------------------------- #
+# tray icon rendering
+# --------------------------------------------------------------------------- #
+
+def render_icon(base_color: QColor, frac: float, pulse: bool, glyph: str = ""):
+    px = QPixmap(64, 64)
+    px.fill(QColor(0, 0, 0, 0))
+    p = QPainter(px)
+    p.setRenderHint(QPainter.Antialiasing)
+
+    # rounded-square body
+    body = QRectF(6, 6, 52, 52)
+    path = QPainterPath()
+    path.addRoundedRect(body, 14, 14)
+    p.fillPath(path, base_color)
+
+    # progress ring toward lock
+    if frac is not None and frac > 0:
+        ring = QRectF(11, 11, 42, 42)
+        pen = QPen(QColor(255, 255, 255, 220), 5)
+        pen.setCapStyle(Qt.RoundCap)
+        p.setPen(pen)
+        p.drawArc(ring, 90 * 16, -int(360 * 16 * min(1.0, frac)))
+
+    # input pulse dot
+    if pulse:
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(255, 255, 255, 240))
+        p.drawEllipse(QPointF(46, 18), 8, 8)
+
+    if glyph:
+        p.setPen(QColor(255, 255, 255, 235))
+        f = p.font()
+        f.setPixelSize(30)
+        f.setBold(True)
+        p.setFont(f)
+        p.drawText(body, Qt.AlignCenter, glyph)
+
+    p.end()
+    return QIcon(px)
+
+
+# --------------------------------------------------------------------------- #
+# activity-monitor window
+# --------------------------------------------------------------------------- #
+
+class Led(QLabel):
+    def __init__(self, text):
+        super().__init__(text)
+        self.setAlignment(Qt.AlignCenter)
+        self.setFixedHeight(26)
+        self.setMinimumWidth(96)
+        self._on = False
+        self._paint()
+
+    def set_on(self, on):
+        if on != self._on:
+            self._on = on
+            self._paint()
+
+    def _paint(self):
+        if self._on:
+            self.setStyleSheet("QLabel{border-radius:6px;padding:2px 8px;"
+                               "background:#27ae60;color:white;font-weight:bold;}")
+        else:
+            self.setStyleSheet("QLabel{border-radius:6px;padding:2px 8px;"
+                               "background:rgba(127,127,127,0.20);}")
+
+
+class MonitorWindow(QWidget):
+    def __init__(self, tray):
+        super().__init__()
+        self.tray = tray
+        self.setWindowTitle("OLED Idle Guard — activity monitor")
+        self.setMinimumWidth(430)
+        self.setWindowIcon(render_icon(COL["active"], None, False))
+
+        mono = QFont("monospace")
+        mono.setStyleHint(QFont.Monospace)
+        mono_pt = mono.pointSize() if mono.pointSize() > 0 else 10
+
+        self.state_lbl = QLabel("…")
+        f = self.state_lbl.font()
+        f.setPointSize(f.pointSize() + 2)
+        f.setBold(True)
+        self.state_lbl.setFont(f)
+
+        # countdowns
+        self.dim_val = QLabel("—")
+        self.lock_val = QLabel("—")
+        big = QFont(mono)
+        big.setPointSize(mono_pt + 12)
+        big.setBold(True)
+        for w in (self.dim_val, self.lock_val):
+            w.setFont(big)
+            w.setAlignment(Qt.AlignCenter)
+        cd = QGridLayout()
+        cd.setHorizontalSpacing(24)
+        h1 = QLabel("DIM IN"); h2 = QLabel("LOCK + BLACK IN")
+        for h in (h1, h2):
+            h.setAlignment(Qt.AlignCenter)
+            h.setStyleSheet("color:#8a8a8a;font-size:10px;letter-spacing:1px;")
+        cd.addWidget(h1, 0, 0); cd.addWidget(h2, 0, 1)
+        cd.addWidget(self.dim_val, 1, 0); cd.addWidget(self.lock_val, 1, 1)
+
+        self.last_input_lbl = QLabel("Last input: never")
+        self.snooze_lbl = QLabel("")
+        self.snooze_lbl.setStyleSheet("color:#8a8a8a;")
+
+        # per-kind LEDs
+        self.leds = {}
+        led_row = QHBoxLayout()
+        for k in ("keyboard", "mouse", "gamepad"):
+            led = Led(f"{KIND_EMOJI[k]}  {k.capitalize()}")
+            self.leds[k] = led
+            led_row.addWidget(led)
+        led_row.addStretch(1)
+
+        # editable timeouts
+        self._cfg_dirty = False
+        self._cfg_syncing = False
+        self._apply_grace = 0.0        # suppress sync briefly after Apply/Reset
+        self._pending = None           # {status-key: value} awaited from daemon
+        self.sp = {}
+        self._echo = {}
+        self.cfg_grp = QGroupBox("Timeouts")
+        g = QGridLayout(self.cfg_grp)
+        rows = [
+            ("dim",    "Dim after",             5,  7200, 15, " s"),
+            ("lock",   "Lock + black after",    10, 14400, 15, " s"),
+            ("relock", "Re-blank when locked",   5,  3600,  5, " s"),
+            ("bright", "Dim to",                 1,   100,  5, " %"),
+        ]
+        for i, (key, label, lo, hi, step, suf) in enumerate(rows):
+            sb = QSpinBox()
+            sb.setRange(lo, hi)
+            sb.setSingleStep(step)
+            sb.setSuffix(suf)
+            sb.setKeyboardTracking(False)
+            sb.valueChanged.connect(self._cfg_touched)
+            ech = QLabel("")
+            ech.setStyleSheet("color:#8a8a8a;")
+            if suf == " s":
+                sb.valueChanged.connect(
+                    lambda v, e=ech: e.setText(f"= {v // 60}:{v % 60:02d}"))
+            g.addWidget(QLabel(label), i, 0)
+            g.addWidget(sb, i, 1)
+            g.addWidget(ech, i, 2)
+            self.sp[key] = sb
+            self._echo[key] = ech
+        g.setColumnStretch(2, 1)
+        apply_btn = QPushButton("Apply")
+        reset_btn = QPushButton("Reset to config file")
+        apply_btn.clicked.connect(self._apply_cfg)
+        reset_btn.clicked.connect(self._reset_cfg)
+        brow = QHBoxLayout()
+        brow.addWidget(apply_btn); brow.addWidget(reset_btn); brow.addStretch(1)
+        g.addLayout(brow, len(rows), 0, 1, 3)
+        self.cfg_hint = QLabel("")
+        self.cfg_hint.setStyleSheet("color:#8a8a8a;font-size:11px;")
+        g.addWidget(self.cfg_hint, len(rows) + 1, 0, 1, 3)
+
+        self.devices_lbl = QLabel("…")
+        self.devices_lbl.setWordWrap(True)
+        self.devices_lbl.setStyleSheet("color:#8a8a8a;font-size:11px;")
+
+        self.log = QPlainTextEdit()
+        self.log.setReadOnly(True)
+        self.log.setFont(mono)
+        self.log.setMaximumBlockCount(400)
+        self.log.setFixedHeight(150)
+
+        # buttons
+        btns = QHBoxLayout()
+        for label, cb in (
+            ("Snooze 30 min", lambda: self.tray.snooze(30)),
+            ("Snooze 1 h", lambda: self.tray.snooze(60)),
+            ("Cancel snooze", self.tray.cancel_snooze),
+            ("Lock now", self.tray.lock_now),
+        ):
+            b = QPushButton(label)
+            b.clicked.connect(cb)
+            btns.addWidget(b)
+
+        line = QFrame(); line.setFrameShape(QFrame.HLine); line.setFrameShadow(QFrame.Sunken)
+
+        lay = QVBoxLayout(self)
+        lay.addWidget(self.state_lbl)
+        lay.addLayout(cd)
+        lay.addSpacing(4)
+        lay.addWidget(self.last_input_lbl)
+        lay.addLayout(led_row)
+        lay.addWidget(self.snooze_lbl)
+        lay.addWidget(self.cfg_grp)
+        lay.addWidget(line)
+        lay.addWidget(QLabel("Watched devices"))
+        lay.addWidget(self.devices_lbl)
+        lay.addWidget(QLabel("Log"))
+        lay.addWidget(self.log)
+        lay.addLayout(btns)
+
+    def append_log(self, msg):
+        self.log.appendPlainText(f"{time.strftime('%H:%M:%S')}  {msg}")
+
+    # -- editable timeouts --------------------------------------------- #
+    def _cfg_touched(self, *_):
+        if self._cfg_syncing:
+            return
+        self._cfg_dirty = True
+        self.cfg_hint.setText("unsaved changes — press Apply")
+
+    def _editing(self):
+        if time.monotonic() < self._apply_grace:
+            return True
+        return self._cfg_dirty or any(sb.hasFocus() for sb in self.sp.values())
+
+    def sync_cfg(self, st):
+        if self._editing():
+            return
+
+        # after an Apply, wait for the daemon to echo the new values back
+        if self._pending is not None:
+            match = all(abs(float(st.get(k, -1)) - v) < 0.5
+                        for k, v in self._pending.items())
+            if match:
+                self._pending = None
+                self.cfg_hint.setText("applied ✓")
+            elif time.monotonic() > self._apply_grace + 3.0:
+                self._pending = None
+                self._cfg_dirty = True       # stay out of sync, keep the values
+                self.cfg_hint.setText(
+                    "⚠ daemon didn't apply this — it may be an old "
+                    "version. Run:  sudo systemctl restart oled-idle-guard")
+                return
+            else:
+                return                       # still waiting
+
+        self._cfg_syncing = True
+        try:
+            self.sp["dim"].setValue(int(round(st.get("dim_timeout", 120))))
+            self.sp["lock"].setValue(int(round(st.get("lock_timeout", 300))))
+            self.sp["relock"].setValue(int(round(st.get("relock_blank_sec", 60))))
+            self.sp["bright"].setValue(int(round(st.get("dim_brightness", 15))))
+        finally:
+            self._cfg_syncing = False
+        if self.cfg_hint.text() not in ("applied ✓",):
+            self.cfg_hint.setText(
+                "live values — differ from /etc/oled-idle-guard.conf"
+                if st.get("overridden") else "matching /etc/oled-idle-guard.conf")
+
+    def _apply_cfg(self):
+        dim = self.sp["dim"].value()
+        lock = self.sp["lock"].value()
+        if lock <= dim:
+            lock = dim + 30
+            self._cfg_syncing = True
+            self.sp["lock"].setValue(lock)
+            self._cfg_syncing = False
+        relock = self.sp["relock"].value()
+        bright = self.sp["bright"].value()
+        self.tray.set_config(dim, lock, relock, bright)
+        self._cfg_dirty = False
+        self._pending = {"dim_timeout": dim, "lock_timeout": lock,
+                         "relock_blank_sec": relock, "dim_brightness": bright}
+        self._apply_grace = time.monotonic() + 1.5
+        self.cfg_hint.setText("applying…")
+
+    def _reset_cfg(self):
+        self.tray.reset_config()
+        self._cfg_dirty = False
+        self._pending = None
+        self._apply_grace = time.monotonic() + 2.0
+        self.cfg_hint.setText("resetting…")
+
+
+# --------------------------------------------------------------------------- #
+# tray controller
+# --------------------------------------------------------------------------- #
+
+class Tray:
+    def __init__(self, app):
+        self.app = app
+        self.icon = QSystemTrayIcon()
+        self.icon.setIcon(render_icon(COL["down"], None, False, "?"))
+        self.icon.setToolTip("OLED Idle Guard — starting…")
+
+        self.win = MonitorWindow(self)
+
+        self.menu = QMenu()
+        self.hdr = QAction("…", self.menu); self.hdr.setEnabled(False)
+        self.menu.addAction(self.hdr)
+        self.menu.addSeparator()
+        act_mon = QAction("Activity monitor…", self.menu)
+        act_mon.triggered.connect(self.toggle_window)
+        self.menu.addAction(act_mon)
+        self.menu.addSeparator()
+        sm = self.menu.addMenu("Snooze")
+        for mins in (15, 30, 60, 120):
+            a = QAction(f"{mins} min" if mins < 60 else f"{mins // 60} hour"
+                        + ("s" if mins >= 120 else ""), sm)
+            a.triggered.connect(lambda _c=False, m=mins: self.snooze(m))
+            sm.addAction(a)
+        a_cancel = QAction("Cancel snooze", sm)
+        a_cancel.triggered.connect(self.cancel_snooze)
+        sm.addSeparator(); sm.addAction(a_cancel)
+        a_lock = QAction("Lock + blank now", self.menu)
+        a_lock.triggered.connect(self.lock_now)
+        self.menu.addAction(a_lock)
+        self.menu.addSeparator()
+        a_quit = QAction("Quit indicator", self.menu)
+        a_quit.triggered.connect(app.quit)
+        self.menu.addAction(a_quit)
+        self.icon.setContextMenu(self.menu)
+        self.icon.activated.connect(self._activated)
+
+        # change tracking for the log / LEDs / icon caching
+        self._prev_state = None
+        self._prev_input_wall = 0.0
+        self._last_logged_input = 0.0
+        self._last_logged_kind = None
+        self._prev_snooze_until = 0.0
+        self._icon_key = None
+        self._led_until = {k: 0.0 for k in self.leds_keys()}
+
+        self.icon.show()
+        self.timer = QTimer()
+        self.timer.timeout.connect(self.tick)
+        self.timer.start(POLL_MS)
+        self.tick()
+
+    def leds_keys(self):
+        return ("keyboard", "mouse", "gamepad")
+
+    # -- actions --------------------------------------------------------- #
+    def _activated(self, reason):
+        if reason in (QSystemTrayIcon.Trigger, QSystemTrayIcon.MiddleClick):
+            self.toggle_window()
+
+    def toggle_window(self):
+        if self.win.isVisible():
+            self.win.hide()
+        else:
+            self.win.show()
+            self.win.raise_()
+            self.win.activateWindow()
+
+    def snooze(self, minutes):
+        until = time.time() + minutes * 60
+        send_command(f"snooze {until:.0f}")
+        self.win.append_log(f"snooze requested: {minutes} min")
+
+    def cancel_snooze(self):
+        send_command("resume")
+        self.win.append_log("snooze cancelled")
+
+    def lock_now(self):
+        send_command("lock")
+        self.win.append_log("lock + blank requested")
+
+    def set_config(self, dim, lock, relock, bright):
+        send_command(f"set-dim {int(dim)}")
+        send_command(f"set-lock {int(lock)}")
+        send_command(f"set-relock {int(relock)}")
+        send_command(f"set-dim-brightness {int(bright)}")
+        self.win.append_log(f"timeouts applied: dim {int(dim)}s · "
+                            f"lock {int(lock)}s · reblank {int(relock)}s · "
+                            f"dim-to {int(bright)}%")
+
+    def reset_config(self):
+        send_command("reset-config")
+        self.win.append_log("timeouts reset to the config file")
+
+    # -- refresh -------------------------------------------------------- #
+    def tick(self):
+        st = read_status()
+        now = time.time()
+
+        if st is None:
+            self._render_down()
+            return
+
+        state = st.get("state", "active")
+        snoozed = bool(st.get("snoozed"))
+        disp = "snoozed" if snoozed else state
+        color = COL.get(disp, COL["down"])
+
+        dim_in = st.get("dim_in")
+        lock_in = st.get("lock_in")
+        lock_to = st.get("lock_timeout") or 1
+        li = st.get("last_input") or {}
+        li_wall = li.get("wall") or 0.0
+        li_kind = li.get("kind") or "other"
+
+        # ---- LEDs / pulse ---------------------------------------------- #
+        if li_wall > self._prev_input_wall:
+            if li_kind in self._led_until:
+                self._led_until[li_kind] = now + LED_HOLD
+            elif li_kind == "touchpad" and "mouse" in self._led_until:
+                self._led_until["mouse"] = now + LED_HOLD
+        self._prev_input_wall = li_wall
+        pulse = any(t > now for t in self._led_until.values())
+        for k, led in self.leds.items():
+            led.set_on(self._led_until.get(k, 0) > now)
+
+        # ---- icon ---------------------------------------------------- #
+        if snoozed:
+            frac, glyph = None, "z"
+        elif state == "locked-blank":
+            frac, glyph = 1.0, ""
+        elif lock_in is not None:
+            frac, glyph = max(0.0, 1.0 - lock_in / lock_to), ""
+        else:
+            frac, glyph = None, ""
+        key = (disp, None if frac is None else round(frac, 2), pulse, glyph)
+        if key != self._icon_key:
+            self._icon_key = key
+            self.icon.setIcon(render_icon(color, frac, pulse, glyph))
+
+        # ---- tooltip / menu header ---------------------------------- #
+        if snoozed:
+            until = st.get("snooze_until", 0)
+            tip = "OLED Idle Guard · snoozed until " + \
+                  time.strftime("%H:%M", time.localtime(until))
+        elif state == "locked-blank":
+            tip = "OLED Idle Guard · locked, screen off"
+        elif state == "dimmed":
+            tip = f"OLED Idle Guard · dimmed · lock in {fmt_clock(lock_in)}"
+        else:
+            tip = (f"OLED Idle Guard · dim in {fmt_clock(dim_in)} · "
+                   f"lock in {fmt_clock(lock_in)}")
+        self.icon.setToolTip(tip)
+        self.hdr.setText(tip.replace("OLED Idle Guard · ", ""))
+
+        # ---- monitor window --------------------------------------- #
+        self._update_window(st, disp, color)
+        self.win.cfg_grp.setEnabled(True)
+        self.win.sync_cfg(st)
+
+        # ---- log transitions ------------------------------------- #
+        if state != self._prev_state and self._prev_state is not None:
+            self.win.append_log(f"state: {self._prev_state} → {state}")
+        self._prev_state = state
+
+        su = st.get("snooze_until", 0) or 0
+        if abs(su - self._prev_snooze_until) > 1:
+            if su > now:
+                self.win.append_log("snoozed until " +
+                                    time.strftime("%H:%M", time.localtime(su)))
+            elif self._prev_snooze_until > now:
+                self.win.append_log("snooze ended")
+        self._prev_snooze_until = su
+
+        if li_wall and li_wall != self._last_logged_input:
+            if (li_kind != self._last_logged_kind
+                    or now - self._last_logged_input > 1.5):
+                dev = li.get("device", "?")
+                self.win.append_log(f"input: {KIND_EMOJI.get(li_kind,'')} "
+                                    f"{li_kind} ({dev})")
+                self._last_logged_input = li_wall
+                self._last_logged_kind = li_kind
+
+    def _update_window(self, st, disp, color):
+        w = self.win
+        state = st.get("state")
+        badge = {
+            "active": "Active", "dimmed": "Dimmed",
+            "locked-blank": "Locked — screen off", "snoozed": "Snoozed",
+        }.get(disp, disp)
+        if disp == "snoozed":
+            until = st.get("snooze_until", 0)
+            badge += " until " + time.strftime("%H:%M", time.localtime(until))
+        w.state_lbl.setText(badge)
+        w.state_lbl.setStyleSheet(f"color:{color.name()};")
+
+        w.dim_val.setText("done" if st.get("dim_in") is None and state != "active"
+                          else fmt_clock(st.get("dim_in")))
+        w.lock_val.setText(fmt_clock(st.get("lock_in")))
+
+        li = st.get("last_input") or {}
+        if li:
+            w.last_input_lbl.setText(
+                f"Last input: {KIND_EMOJI.get(li.get('kind'),'')} "
+                f"{li.get('kind','?')} · {li.get('device','?')} — "
+                f"{fmt_ago(li.get('wall'))}")
+        else:
+            w.last_input_lbl.setText("Last input: never")
+
+        counts = st.get("counts", {})
+        for k, led in self.leds.items():
+            n = counts.get(k, 0)
+            led.setText(f"{KIND_EMOJI[k]}  {k.capitalize()}"
+                        + (f"  ×{n}" if n else ""))
+
+        if st.get("snoozed"):
+            w.snooze_lbl.setText("")
+        elif state == "locked-blank":
+            w.snooze_lbl.setText("screen powered off (DPMS) — press a key to "
+                                 "show the lock screen")
+        else:
+            w.snooze_lbl.setText(f"idle {fmt_clock(st.get('idle'))} · "
+                                 f"dims at {int(st.get('dim_timeout',0))}s, "
+                                 f"locks at {int(st.get('lock_timeout',0))}s")
+
+        devs = st.get("devices", [])
+        by_kind = {}
+        for d in devs:
+            by_kind.setdefault(d["kind"], []).append(d["name"])
+        parts = []
+        for k in KIND_ORDER:
+            if k in by_kind:
+                parts.append(f"{KIND_EMOJI[k]} " + ", ".join(sorted(set(by_kind[k]))))
+        w.devices_lbl.setText("   ".join(parts) if parts else "none")
+
+    def _render_down(self):
+        key = ("down",)
+        if self._icon_key != key:
+            self._icon_key = key
+            self.icon.setIcon(render_icon(COL["down"], None, False, "?"))
+        self.icon.setToolTip("OLED Idle Guard — daemon not running")
+        self.hdr.setText("daemon not running")
+        self.win.state_lbl.setText("Guard not running")
+        self.win.state_lbl.setStyleSheet(f"color:{COL['down'].name()};")
+        self.win.dim_val.setText("—")
+        self.win.lock_val.setText("—")
+        for led in self.leds.values():
+            led.set_on(False)
+        if not self.win._cfg_dirty:
+            self.win.cfg_grp.setEnabled(False)
+        if self._prev_state not in (None, "down"):
+            self.win.append_log("daemon went away")
+        self._prev_state = "down"
+
+    @property
+    def leds(self):
+        return self.win.leds
+
+
+def main():
+    app = QApplication([])
+    app.setApplicationName("oled-idle-guard-tray")
+    app.setQuitOnLastWindowClosed(False)
+
+    # the tray host may appear a moment after we do
+    for _ in range(30):
+        if QSystemTrayIcon.isSystemTrayAvailable():
+            break
+        time.sleep(1)
+
+    Tray(app)
+    app.exec()
+
+
+if __name__ == "__main__":
+    main()

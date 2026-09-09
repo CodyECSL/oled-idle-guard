@@ -1,0 +1,35 @@
+[Unit]
+Description=OLED idle guard - dim, lock and blank on real inactivity (even during games)
+Documentation=file:/usr/local/share/doc/oled-idle-guard/README.md
+After=systemd-logind.service
+Wants=systemd-logind.service
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/oled-idle-guard.conf
+ExecStart=/usr/local/bin/oled-idle-guard
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=10
+
+# /var/lib/oled-idle-guard - holds overrides.json (live timeout changes from
+# the tray). systemd creates it and adds it to ReadWritePaths automatically.
+StateDirectory=oled-idle-guard
+
+# Needs: /dev/input/* (root or 'input'), loginctl, runuser, kscreen-doctor.
+# Runs as root because the compositor never exposes keyboard/mouse idle while a
+# game holds an idle inhibitor, so the raw evdev streams must be read directly.
+User=root
+Nice=-5
+
+# light hardening -- deliberately loose: the service has to setuid into the
+# desktop user and run kscreen-doctor / loginctl, which touch $HOME and D-Bus.
+ProtectSystem=strict
+ReadWritePaths=/run /home
+ProtectHome=no
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

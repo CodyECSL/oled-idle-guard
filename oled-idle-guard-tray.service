@@ -1,0 +1,15 @@
+[Unit]
+Description=OLED Idle Guard tray indicator
+Documentation=file:/usr/local/share/doc/oled-idle-guard/README.md
+PartOf=graphical-session.target
+After=graphical-session.target plasma-workspace.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/oled-idle-guard-tray
+Restart=on-failure
+RestartSec=5
+Slice=session.slice
+
+[Install]
+WantedBy=graphical-session.target

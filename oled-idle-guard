@@ -1,0 +1,738 @@
+#!/usr/bin/env python3
+"""
+oled-idle-guard
+===============
+
+Dims, then locks and blanks (DPMS off) the screen after a period with NO real
+user input -- keyboard, mouse OR gamepad -- even while a game (or anything else)
+holds a Wayland/D-Bus idle inhibitor.
+
+Why this exists
+---------------
+On KDE Plasma Wayland, PowerDevil (dimming / "turn off screen") and KScreenLocker
+(auto-lock) both detect idleness via KWin's idle-notify protocol.  KWin *pauses*
+that protocol whenever an application holds an idle inhibitor, which almost every
+full-screen game does.  Result: no dimming, no lock, no screen-off during games.
+Separately, gamepad input is never seen by the compositor at all, so it neither
+counts as activity nor resets any timer.
+
+This daemon sidesteps all of that: it reads the raw evdev input streams directly
+(keyboards, mice, touchpads AND gamepads), keeps its own "last activity" clock,
+and drives dim / lock / DPMS itself.  It runs as root (for /dev/input access) and
+shells out to the user's session for the KDE-side actions.
+
+Actions
+-------
+  idle >= DIM_TIMEOUT   : lower brightness on every connected output to DIM_BRIGHTNESS%
+  idle >= LOCK_TIMEOUT  : loginctl lock-session  +  kscreen-doctor --dpms off
+  any input             : restore brightness / DPMS on (does NOT unlock)
+  while locked, screen
+  woken but idle again
+  for RELOCK_BLANK_SEC  : DPMS off again  (keeps the lock screen from burning in)
+  session unlocked      : restore brightness, back to normal
+
+IPC (for the tray indicator)
+----------------------------
+  writes  /run/oled-idle-guard.state           live status as JSON, ~4x/second
+  reads   /run/user/<uid>/oled-idle-guard.cmd  one command per line, then deletes:
+              snooze <unix-epoch>       suppress dim/lock until that time
+              resume                    cancel a snooze
+              lock                      lock + blank right now
+              wake                      count as activity right now
+              set-dim <seconds>         change the dim timeout live + persist
+              set-lock <seconds>        change the lock+blank timeout live + persist
+              set-relock <seconds>      change the re-blank-while-locked timeout
+              set-dim-brightness <pct>  change the dim brightness %
+              reset-config              forget live changes, revert to the conf file
+
+Live timeout changes are persisted to $STATE_DIRECTORY/overrides.json
+(/var/lib/oled-idle-guard/overrides.json) and reloaded on restart; they take
+precedence over the values in /etc/oled-idle-guard.conf.
+
+Configuration (env / EnvironmentFile, see /etc/oled-idle-guard.conf)
+-------------------------------------------------------------------
+  GUARD_UID               numeric uid of the desktop user            (required)
+  GUARD_USER              user name of the desktop user              (required)
+  DIM_TIMEOUT             seconds of inactivity before dimming       (default 120)
+  LOCK_TIMEOUT            seconds of inactivity before lock+blank    (default 300)
+  RELOCK_BLANK_SEC        while locked, re-blank after this idle     (default 60)
+  DIM_BRIGHTNESS          brightness % applied when dimming          (default 15)
+  ABS_THRESHOLD_FRAC      fraction of an axis range that counts as
+                          gamepad-stick movement (drift rejection)   (default 0.10)
+  TICK_SEC               main-loop granularity                       (default 1.0)
+  DEVICE_RESCAN_SEC      how often to look for hot-plugged devices   (default 4.0)
+  DEBUG                  "1" to log every activity event             (default 0)
+"""
+
+import glob
+import json
+import os
+import pwd
+import selectors
+import signal
+import subprocess
+import sys
+import time
+
+try:
+    import evdev
+    from evdev import ecodes
+except ImportError:
+    sys.stderr.write("oled-idle-guard: python-evdev is not installed "
+                     "(pacman -S python-evdev)\n")
+    sys.exit(1)
+
+# ----------------------------------------------------------------------------- #
+# config
+# ----------------------------------------------------------------------------- #
+
+def _int(name, default):
+    try:
+        return int(os.environ.get(name, default))
+    except ValueError:
+        return int(default)
+
+def _float(name, default):
+    try:
+        return float(os.environ.get(name, default))
+    except ValueError:
+        return float(default)
+
+UID                = _int("GUARD_UID", -1)
+USER               = os.environ.get("GUARD_USER", "")
+DIM_TIMEOUT        = _float("DIM_TIMEOUT", 120)
+LOCK_TIMEOUT       = _float("LOCK_TIMEOUT", 300)
+RELOCK_BLANK_SEC   = _float("RELOCK_BLANK_SEC", 60)
+DIM_BRIGHTNESS     = max(1, min(100, _int("DIM_BRIGHTNESS", 15)))
+ABS_THRESHOLD_FRAC = _float("ABS_THRESHOLD_FRAC", 0.10)
+TICK_SEC           = _float("TICK_SEC", 1.0)
+DEVICE_RESCAN_SEC  = _float("DEVICE_RESCAN_SEC", 4.0)
+DEBUG              = os.environ.get("DEBUG", "0") == "1"
+
+STATE_FILE  = "/run/oled-idle-guard.state"
+CMD_FILE    = f"/run/user/{UID}/oled-idle-guard.cmd"
+_STATE_DIR  = os.environ.get("STATE_DIRECTORY", "/var/lib/oled-idle-guard").split(":")[0]
+OVERRIDES_FILE = os.path.join(_STATE_DIR, "overrides.json")
+STATUS_MIN_INTERVAL = 0.25
+
+if UID < 0 or not USER:
+    sys.stderr.write("oled-idle-guard: GUARD_UID and GUARD_USER must be set\n")
+    sys.exit(1)
+
+def log(*a):
+    print(time.strftime("%H:%M:%S"), *a, flush=True)
+
+
+# ----------------------------------------------------------------------------- #
+# runtime-tunable timings (conf file -> overrides.json -> live tray edits)
+# ----------------------------------------------------------------------------- #
+
+class Cfg:
+    """Timeouts the tray can change on the fly.  Defaults come from the env
+    (EnvironmentFile); overrides.json, if present, wins; tray `set-*` commands
+    update both this object and overrides.json."""
+
+    _FIELDS = ("dim", "lock", "relock", "dim_brightness")
+    _JSON_KEYS = {
+        "dim": "dim_timeout", "lock": "lock_timeout",
+        "relock": "relock_blank_sec", "dim_brightness": "dim_brightness",
+    }
+
+    def __init__(self):
+        self.dim = DIM_TIMEOUT
+        self.lock = LOCK_TIMEOUT
+        self.relock = RELOCK_BLANK_SEC
+        self.dim_brightness = DIM_BRIGHTNESS
+        self.load()
+        self.clamp()
+
+    def clamp(self):
+        self.dim = max(5.0, float(self.dim))
+        self.lock = max(self.dim + 5.0, float(self.lock))
+        self.relock = max(5.0, float(self.relock))
+        self.dim_brightness = min(100, max(1, int(round(float(self.dim_brightness)))))
+
+    def load(self):
+        try:
+            with open(OVERRIDES_FILE) as fh:
+                d = json.load(fh)
+        except (OSError, json.JSONDecodeError):
+            return
+        for attr, key in self._JSON_KEYS.items():
+            if key in d:
+                try:
+                    setattr(self, attr, float(d[key]))
+                except (TypeError, ValueError):
+                    pass
+
+    def save(self):
+        try:
+            os.makedirs(_STATE_DIR, exist_ok=True)
+            tmp = f"{OVERRIDES_FILE}.tmp"
+            with open(tmp, "w") as fh:
+                json.dump({self._JSON_KEYS[a]: getattr(self, a)
+                           for a in self._FIELDS}, fh)
+            os.replace(tmp, OVERRIDES_FILE)
+        except OSError as e:                                 # noqa: BLE001
+            log("could not persist overrides:", repr(e))
+
+    def reset(self):
+        self.dim, self.lock = DIM_TIMEOUT, LOCK_TIMEOUT
+        self.relock, self.dim_brightness = RELOCK_BLANK_SEC, DIM_BRIGHTNESS
+        self.clamp()
+        try:
+            os.unlink(OVERRIDES_FILE)
+        except OSError:
+            pass
+
+
+# ----------------------------------------------------------------------------- #
+# talking to the user's Wayland / D-Bus session
+# ----------------------------------------------------------------------------- #
+
+_runtime_dir = f"/run/user/{UID}"
+try:
+    _home = pwd.getpwuid(UID).pw_dir
+except KeyError:
+    _home = f"/home/{USER}"
+
+_WHITELIST = ("XDG_RUNTIME_DIR", "WAYLAND_DISPLAY", "DBUS_SESSION_BUS_ADDRESS",
+              "HOME", "USER", "LOGNAME", "XDG_SESSION_TYPE", "XDG_CURRENT_DESKTOP")
+
+
+def _user_env():
+    socks = sorted(
+        os.path.basename(p)
+        for p in glob.glob(f"{_runtime_dir}/wayland-*")
+        if not p.endswith(".lock")
+    )
+    env = dict(os.environ)
+    env["XDG_RUNTIME_DIR"] = _runtime_dir
+    env["WAYLAND_DISPLAY"] = socks[0] if socks else "wayland-0"
+    env["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={_runtime_dir}/bus"
+    env["HOME"] = _home
+    env["USER"] = USER
+    env["LOGNAME"] = USER
+    env["XDG_SESSION_TYPE"] = "wayland"
+    env["XDG_CURRENT_DESKTOP"] = "KDE"
+    return env
+
+
+def run_as_user(args, timeout=20):
+    """Run a command inside the desktop user's session. Returns CompletedProcess or None."""
+    env = _user_env()
+    cmd = [
+        "runuser",
+        "--whitelist-environment=" + ",".join(_WHITELIST),
+        "-u", USER, "--",
+    ] + list(args)
+    try:
+        cp = subprocess.run(cmd, env=env, timeout=timeout,
+                            capture_output=True, text=True)
+        if cp.returncode != 0 and DEBUG:
+            log("cmd failed", args, cp.returncode, cp.stderr.strip())
+        return cp
+    except Exception as e:                                    # noqa: BLE001
+        log("run_as_user error:", args, repr(e))
+        return None
+
+
+def get_session():
+    """The desktop user's primary graphical session id, or None."""
+    try:
+        cp = subprocess.run(
+            ["loginctl", "show-user", str(UID), "-p", "Display", "--value"],
+            capture_output=True, text=True, timeout=5,
+        )
+        sid = cp.stdout.strip()
+        if sid:
+            return sid
+    except Exception:                                        # noqa: BLE001
+        pass
+    try:
+        cp = subprocess.run(["loginctl", "list-sessions", "--no-legend"],
+                            capture_output=True, text=True, timeout=5)
+        for line in cp.stdout.splitlines():
+            parts = line.split()
+            if len(parts) >= 4 and parts[1] == str(UID) and parts[3] == "seat0":
+                return parts[0]
+    except Exception:                                        # noqa: BLE001
+        pass
+    return None
+
+
+def session_locked(session):
+    try:
+        cp = subprocess.run(
+            ["loginctl", "show-session", session, "-p", "LockedHint", "--value"],
+            capture_output=True, text=True, timeout=5,
+        )
+        return cp.stdout.strip() == "yes"
+    except Exception:                                        # noqa: BLE001
+        return False
+
+
+def lock_session(session):
+    try:
+        subprocess.run(["loginctl", "lock-session", session], timeout=10)
+    except Exception as e:                                   # noqa: BLE001
+        log("lock-session failed:", repr(e))
+
+
+def connected_outputs():
+    cp = run_as_user(["kscreen-doctor", "-j"])
+    if not cp or cp.returncode != 0:
+        return []
+    try:
+        data = json.loads(cp.stdout)
+    except json.JSONDecodeError:
+        return []
+    out = []
+    for o in data.get("outputs", []):
+        if o.get("connected") and o.get("enabled"):
+            out.append((o["name"], o.get("brightness", 1.0)))
+    return out
+
+
+def set_brightness(pct):
+    outs = connected_outputs()
+    if not outs:
+        return
+    args = ["kscreen-doctor"] + [f"output.{name}.brightness.{pct}" for name, _ in outs]
+    run_as_user(args)
+
+
+def restore_brightness(saved):
+    outs = connected_outputs()
+    if not outs:
+        return
+    args = ["kscreen-doctor"]
+    for name, _cur in outs:
+        val = saved.get(name, 100)
+        args.append(f"output.{name}.brightness.{val}")
+    run_as_user(args)
+
+
+def dpms(mode):                                              # "on" | "off"
+    run_as_user(["kscreen-doctor", "--dpms", mode])
+
+
+# ----------------------------------------------------------------------------- #
+# status file (for the tray indicator) + command file
+# ----------------------------------------------------------------------------- #
+
+def write_status(d):
+    tmp = f"{STATE_FILE}.{os.getpid()}.tmp"
+    try:
+        with open(tmp, "w") as fh:
+            json.dump(d, fh)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, STATE_FILE)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def load_saved_brightness():
+    try:
+        with open(STATE_FILE) as fh:
+            return json.load(fh).get("saved_brightness", {}) or {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def read_commands():
+    try:
+        with open(CMD_FILE) as fh:
+            lines = fh.read().splitlines()
+        os.unlink(CMD_FILE)
+        return [ln.strip() for ln in lines if ln.strip()]
+    except FileNotFoundError:
+        return []
+    except OSError:
+        return []
+
+
+# ----------------------------------------------------------------------------- #
+# raw input monitoring
+# ----------------------------------------------------------------------------- #
+
+_ACTIVITY_TYPES = (ecodes.EV_KEY, ecodes.EV_REL, ecodes.EV_ABS)
+_GAMEPAD_BTNS = set(range(0x120, 0x140))          # BTN_JOYSTICK .. BTN_THUMBR
+
+
+def _classify(dev):
+    caps = dev.capabilities()
+    keys = set(caps.get(ecodes.EV_KEY, []))
+    has_rel = ecodes.EV_REL in caps
+    if keys & _GAMEPAD_BTNS:
+        return "gamepad"
+    if ecodes.BTN_TOUCH in keys and ecodes.BTN_TOOL_FINGER in keys:
+        return "touchpad"
+    if not has_rel and (ecodes.KEY_A in keys and ecodes.KEY_Z in keys):
+        return "keyboard"
+    if has_rel and (ecodes.BTN_LEFT in keys or ecodes.BTN_MOUSE in keys):
+        return "mouse"
+    if ecodes.KEY_ENTER in keys or ecodes.KEY_ESC in keys or ecodes.KEY_SPACE in keys:
+        return "keyboard"
+    return "other"
+
+
+class InputWatcher:
+    def __init__(self):
+        self.sel = selectors.DefaultSelector()
+        self.devices = {}          # path -> InputDevice
+        self.kind = {}             # path -> "keyboard" | "mouse" | ...
+        self._abs_last = {}        # (path, axis) -> last value
+        self._abs_thr = {}         # (path, axis) -> threshold
+        self.rescan()
+
+    def _interesting(self, dev):
+        caps = dev.capabilities()
+        return any(t in caps for t in _ACTIVITY_TYPES)
+
+    def rescan(self):
+        current = set(evdev.list_devices())
+        known = set(self.devices)
+
+        for path in current - known:
+            try:
+                dev = evdev.InputDevice(path)
+            except (OSError, PermissionError):
+                continue
+            if not self._interesting(dev):
+                dev.close()
+                continue
+            try:
+                self.sel.register(dev.fileno(), selectors.EVENT_READ, dev)
+            except (KeyError, ValueError):
+                dev.close()
+                continue
+            self.devices[path] = dev
+            self.kind[path] = _classify(dev)
+            try:
+                for code, info in dev.capabilities().get(ecodes.EV_ABS, []):
+                    rng = (info.max - info.min) or 1
+                    self._abs_thr[(path, code)] = max(1, abs(rng) * ABS_THRESHOLD_FRAC)
+                    self._abs_last[(path, code)] = info.value
+            except Exception:                                # noqa: BLE001
+                pass
+            log(f"watching {path} [{self.kind[path]}] - {dev.name}")
+
+        for path in known - current:
+            self._drop(path)
+
+    def _drop(self, path):
+        dev = self.devices.pop(path, None)
+        self.kind.pop(path, None)
+        if dev is None:
+            return
+        try:
+            self.sel.unregister(dev.fileno())
+        except (KeyError, ValueError):
+            pass
+        try:
+            dev.close()
+        except OSError:
+            pass
+        for key in [k for k in self._abs_last if k[0] == path]:
+            self._abs_last.pop(key, None)
+            self._abs_thr.pop(key, None)
+        log(f"dropped {path}")
+
+    def poll(self, timeout):
+        """Return (activity: bool, kind: str|None, device_name: str|None)."""
+        activity = False
+        kind = None
+        name = None
+        for key, _mask in self.sel.select(timeout):
+            dev = key.data
+            path = dev.path
+            try:
+                for ev in dev.read():
+                    hit = False
+                    if ev.type == ecodes.EV_KEY:
+                        hit = True
+                    elif ev.type == ecodes.EV_REL:
+                        hit = True
+                    elif ev.type == ecodes.EV_ABS:
+                        k = (path, ev.code)
+                        last = self._abs_last.get(k)
+                        thr = self._abs_thr.get(k, 1)
+                        self._abs_last[k] = ev.value
+                        hit = last is None or abs(ev.value - last) >= thr
+                    if hit:
+                        activity = True
+                        if kind is None:
+                            kind = self.kind.get(path, "other")
+                            name = dev.name
+            except OSError:
+                self._drop(path)
+        return activity, kind, name
+
+    def summary(self):
+        counts = {}
+        devs = []
+        for path, dev in self.devices.items():
+            k = self.kind.get(path, "other")
+            counts[k] = counts.get(k, 0) + 1
+            devs.append({"name": dev.name, "kind": k})
+        devs.sort(key=lambda d: (d["kind"], d["name"]))
+        return counts, devs
+
+    def close(self):
+        for path in list(self.devices):
+            self._drop(path)
+
+
+# ----------------------------------------------------------------------------- #
+# main loop
+# ----------------------------------------------------------------------------- #
+
+ST_ACTIVE = "active"
+ST_DIMMED = "dimmed"
+ST_LOCKED = "locked-blank"
+
+_running = True
+
+
+def _stop(_sig, _frm):
+    global _running
+    _running = False
+
+
+def main():
+    signal.signal(signal.SIGTERM, _stop)
+    signal.signal(signal.SIGINT, _stop)
+
+    cfg = Cfg()
+    log(f"start: dim={cfg.dim:.0f}s lock={cfg.lock:.0f}s "
+        f"relock-blank={cfg.relock:.0f}s dim-to={cfg.dim_brightness}% "
+        f"user={USER}({UID})"
+        + ("  [overrides.json active]" if os.path.exists(OVERRIDES_FILE) else ""))
+
+    watcher = InputWatcher()
+
+    saved_brightness = load_saved_brightness()
+    state = ST_ACTIVE
+
+    last_activity = time.monotonic()
+    last_rescan = 0.0
+    last_status = 0.0
+    last_screen_wake = 0.0
+    lock_initiated_at = 0.0
+    seen_locked = False
+    dpms_is_off = False
+    session = None
+    prev_wall = time.time()
+    snooze_until = 0.0
+    last_input = None                 # {"kind","device","wall"}
+
+    LOCK_CONFIRM_GRACE = 15.0
+
+    # come up in a known-good state
+    if saved_brightness:
+        restore_brightness(saved_brightness)
+
+    while _running:
+        now = time.monotonic()
+        wall = time.time()
+
+        # ---- suspend/resume: wall clock jumped -> treat as idle ---------- #
+        if wall - prev_wall > max(30, TICK_SEC * 10):
+            log("time jump (resume?) - treating as idle")
+            last_activity = now - cfg.lock
+        prev_wall = wall
+
+        # ---- periodic housekeeping ------------------------------------- #
+        if now - last_rescan >= DEVICE_RESCAN_SEC:
+            watcher.rescan()
+            if session is None or not os.path.exists(f"/run/user/{UID}/bus"):
+                session = get_session()
+            last_rescan = now
+
+        # ---- commands from the tray ---------------------------------- #
+        for cmd in read_commands():
+            head, _, arg = cmd.partition(" ")
+            head = head.lower()
+            if head == "snooze":
+                try:
+                    snooze_until = float(arg)
+                except ValueError:
+                    snooze_until = wall + 1800
+                log(f"command: snooze until {time.strftime('%H:%M', time.localtime(snooze_until))}")
+            elif head in ("resume", "unsnooze"):
+                snooze_until = 0.0
+                last_activity = now
+                log("command: resume")
+            elif head == "wake":
+                last_activity = now
+            elif head == "lock":
+                log("command: lock now")
+                last_activity = now - max(cfg.lock, cfg.dim) - 1
+            elif head in ("set-dim", "set-lock", "set-relock", "set-dim-brightness"):
+                try:
+                    val = float(arg)
+                except ValueError:
+                    log(f"command: {head} - bad value {arg!r}")
+                else:
+                    attr = {"set-dim": "dim", "set-lock": "lock",
+                            "set-relock": "relock",
+                            "set-dim-brightness": "dim_brightness"}[head]
+                    setattr(cfg, attr, val)
+                    cfg.clamp()
+                    cfg.save()
+                    log(f"command: {head} -> dim={cfg.dim:.0f}s lock={cfg.lock:.0f}s "
+                        f"relock={cfg.relock:.0f}s dim-to={cfg.dim_brightness}%")
+            elif head in ("reset-config", "reset"):
+                cfg.reset()
+                log(f"command: reset-config -> dim={cfg.dim:.0f}s lock={cfg.lock:.0f}s "
+                    f"relock={cfg.relock:.0f}s dim-to={cfg.dim_brightness}%")
+
+        # ---- input ------------------------------------------------- #
+        activity, kind, dev_name = watcher.poll(TICK_SEC)
+        now = time.monotonic()
+        wall = time.time()
+        if activity:
+            last_activity = now
+            last_input = {"kind": kind or "other", "device": dev_name or "?",
+                          "wall": wall}
+            if DEBUG:
+                log(f"activity: {kind} ({dev_name})")
+
+        idle = now - last_activity
+        locked = session_locked(session) if session else False
+        snoozed = wall < snooze_until
+
+        # ---- external lock (Meta+L, lock applet, ...) ------------- #
+        if locked and state != ST_LOCKED:
+            log("session locked externally -> blank guard armed")
+            if state != ST_DIMMED:
+                saved_brightness = {n: round(b * 100) for n, b in connected_outputs()}
+            state = ST_LOCKED
+            seen_locked = True
+            lock_initiated_at = now
+            last_screen_wake = now
+
+        # ---- snoozed: behave as fully awake ---------------------- #
+        if snoozed and state in (ST_ACTIVE, ST_DIMMED):
+            last_activity = now
+            idle = 0.0
+            if state == ST_DIMMED:
+                log("snoozed -> undim")
+                restore_brightness(saved_brightness)
+                state = ST_ACTIVE
+            if dpms_is_off and not locked:
+                dpms("on")
+                dpms_is_off = False
+
+        # ---- active / dimmed ------------------------------------ #
+        if state in (ST_ACTIVE, ST_DIMMED) and not snoozed:
+            if activity and state == ST_DIMMED:
+                log("activity -> undim")
+                restore_brightness(saved_brightness)
+                state = ST_ACTIVE
+
+            elif idle >= cfg.lock:
+                log(f"idle {idle:.0f}s -> lock + blank")
+                if session is None:
+                    session = get_session()
+                if session:
+                    lock_session(session)
+                if state != ST_DIMMED:
+                    saved_brightness = {n: round(b * 100) for n, b in connected_outputs()}
+                dpms("off")
+                dpms_is_off = True
+                state = ST_LOCKED
+                seen_locked = False
+                lock_initiated_at = now
+                last_screen_wake = now
+
+            elif idle >= cfg.dim and state == ST_ACTIVE:
+                outs = connected_outputs()
+                saved_brightness = {n: round(b * 100) for n, b in outs}
+                if any(round(b * 100) > cfg.dim_brightness for _, b in outs):
+                    log(f"idle {idle:.0f}s -> dim to {cfg.dim_brightness}%")
+                    set_brightness(cfg.dim_brightness)
+                state = ST_DIMMED
+
+        # ---- locked + blank ------------------------------------ #
+        elif state == ST_LOCKED:
+            if locked:
+                seen_locked = True
+
+            if seen_locked and not locked:
+                log("session unlocked -> restoring")
+                if dpms_is_off:
+                    dpms("on")
+                    dpms_is_off = False
+                restore_brightness(saved_brightness)
+                state = ST_ACTIVE
+                last_activity = now
+            else:
+                if activity:
+                    if dpms_is_off:
+                        log("activity while locked -> screen on (still locked)")
+                        dpms("on")
+                        dpms_is_off = False
+                    last_screen_wake = now
+                elif not dpms_is_off and (now - last_screen_wake) >= cfg.relock:
+                    log("locked & idle again -> blank")
+                    dpms("off")
+                    dpms_is_off = True
+
+                if not seen_locked and (now - lock_initiated_at) >= LOCK_CONFIRM_GRACE:
+                    log(f"lock not confirmed after {LOCK_CONFIRM_GRACE:.0f}s -> retrying lock")
+                    if session is None:
+                        session = get_session()
+                    if session:
+                        lock_session(session)
+                    lock_initiated_at = now
+                    if not dpms_is_off:
+                        dpms("off")
+                        dpms_is_off = True
+
+        # ---- publish status ----------------------------------- #
+        if now - last_status >= STATUS_MIN_INTERVAL or activity:
+            last_status = now
+            counts, devs = watcher.summary()
+            if snoozed:
+                dim_in = lock_in = None
+            elif state == ST_LOCKED:
+                dim_in = lock_in = None
+            else:
+                dim_in = max(0.0, cfg.dim - idle) if state == ST_ACTIVE else None
+                lock_in = max(0.0, cfg.lock - idle)
+            write_status({
+                "pid": os.getpid(),
+                "ts": wall,
+                "state": state,
+                "idle": round(idle, 2),
+                "snoozed": snoozed,
+                "snooze_until": snooze_until,
+                "locked": locked,
+                "dpms_off": dpms_is_off,
+                "dim_timeout": cfg.dim,
+                "lock_timeout": cfg.lock,
+                "relock_blank_sec": cfg.relock,
+                "dim_brightness": cfg.dim_brightness,
+                "overridden": os.path.exists(OVERRIDES_FILE),
+                "dim_in": None if dim_in is None else round(dim_in, 2),
+                "lock_in": None if lock_in is None else round(lock_in, 2),
+                "session": session,
+                "last_input": last_input,
+                "counts": counts,
+                "devices": devs,
+                "saved_brightness": saved_brightness,
+            })
+
+    log("stopping")
+    watcher.close()
+    write_status({"pid": os.getpid(), "ts": time.time(), "state": "stopped",
+                  "saved_brightness": saved_brightness})
+
+
+if __name__ == "__main__":
+    main()
