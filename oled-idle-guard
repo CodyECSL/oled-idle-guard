@@ -549,8 +549,15 @@ def main():
         # ---- periodic housekeeping ------------------------------------- #
         if now - last_rescan >= DEVICE_RESCAN_SEC:
             watcher.rescan()
-            if session is None or not os.path.exists(f"/run/user/{UID}/bus"):
-                session = get_session()
+            # Always re-fetch, not just when the bus socket is missing: a
+            # logout/login for the same uid can hand out a new logind session
+            # id while /run/user/<uid>/bus keeps existing (systemd --user
+            # instance stays up), which would otherwise leave `session`
+            # pinned to a dead id and every loginctl call against it failing
+            # silently (locked stuck False, lock-session retries forever).
+            # Keep the last-known id on a transient lookup failure rather
+            # than clobbering it with None.
+            session = get_session() or session
             last_rescan = now
 
         # ---- commands from the tray ---------------------------------- #
