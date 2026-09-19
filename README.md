@@ -1,5 +1,7 @@
 # oled-idle-guard
 
+![Example](https://github.com/CodyECSL/oled-idle-guard/blob/main/image(3).png)
+
 **Lock and blank your screen on real inactivity — even while a game is running —
 and treat a game controller as activity so it doesn't fire while you're playing.**
 
